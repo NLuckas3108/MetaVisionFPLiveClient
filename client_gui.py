@@ -3,20 +3,21 @@ import cv2
 import numpy as np
 import pyrealsense2 as rs
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QVBoxLayout, 
-                             QHBoxLayout, QWidget, QPushButton, QFileDialog, QColorDialog)
+                             QHBoxLayout, QWidget, QPushButton, QFileDialog, QColorDialog, QFrame)
 from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QBrush
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QPoint
 
+# --- 3D Visualization Library ---
+import pyvista as pv
+from pyvistaqt import QtInteractor
+
 # --- 1. Eigene Label-Klasse für Mausklicks ---
 class ClickableVideoLabel(QLabel):
-    # Signal definiert: sendet x und y Koordinate beim Klick
     on_click = pyqtSignal(int, int)
 
     def mousePressEvent(self, event):
-        # Wir wollen nur linke Mausklicks
         if event.button() == Qt.MouseButton.LeftButton:
             self.on_click.emit(event.pos().x(), event.pos().y())
-        # Event weiterreichen (Good Practice)
         super().mousePressEvent(event)
 
 # --- 2. Der Kamera-Worker (Unverändert) ---
@@ -31,13 +32,11 @@ class RealSenseThread(QThread):
     def run(self):
         self.pipeline = rs.pipeline()
         config = rs.config()
-        # 640x480 ist wichtig für die Klick-Koordinaten
         config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
         config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
 
         try:
             self.pipeline.start(config)
-            
             while self._run_flag:
                 frames = self.pipeline.wait_for_frames()
                 color_frame = frames.get_color_frame()
@@ -48,10 +47,8 @@ class RealSenseThread(QThread):
                 h, w, ch = rgb_image.shape
                 bytes_per_line = ch * w
                 
-                # Wir skalieren hier direkt auf 640x480, damit Bild- und Label-Koordinaten 1:1 passen
                 convert_to_Qt_format = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
                 p = convert_to_Qt_format.scaled(640, 480, Qt.AspectRatioMode.IgnoreAspectRatio)
-                
                 self.change_pixmap_signal.emit(p)
 
         except Exception as e:
@@ -70,30 +67,71 @@ class RealSenseThread(QThread):
             except RuntimeError:
                 pass
 
-# --- 3. Die GUI ---
+# --- 3. Das CAD-Vorschau Widget (Angepasst für Farb-Updates) ---
+class CADPreviewWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        self.plotter = QtInteractor(self)
+        self.layout.addWidget(self.plotter.interactor)
+        
+        # --- ÄNDERUNG: Hintergrund auf Schwarz setzen ---
+        self.plotter.set_background("#000000") 
+        
+        # Optional: Achsen weglassen für einen cleaner Look
+        # self.plotter.add_axes() 
+        
+        self.plotter.view_isometric()
+        self.mesh_actor = None
+
+    def load_mesh(self, file_path, initial_qcolor=None):
+        try:
+            self.plotter.clear()
+            # Falls du die Achsen doch willst, hier wieder einkommentieren:
+            # self.plotter.add_axes()
+            
+            mesh = pv.read(file_path)
+            c = "lightgrey"
+            if initial_qcolor and initial_qcolor.isValid():
+                 c = initial_qcolor.name()
+
+            self.mesh_actor = self.plotter.add_mesh(mesh, color=c, pbr=True, metallic=0.5)
+            self.plotter.reset_camera()
+            self.plotter.render()
+        except Exception as e:
+            print(f"[ERROR] Konnte CAD nicht laden: {e}")
+
+    def update_color(self, qcolor):
+        if self.mesh_actor and qcolor.isValid():
+            self.mesh_actor.prop.color = qcolor.name()
+            self.plotter.render()
+
+
+# --- 4. Die GUI ---
 class ClientApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("FoundationPose Client")
-        self.setGeometry(100, 100, 900, 550)
+        self.setGeometry(100, 100, 1000, 600)
         self.setStyleSheet("background-color: #2b2b2b; color: white;")
 
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.main_layout = QHBoxLayout(self.central_widget)
 
-        # --- Variablen für Maske ---
-        self.drawing_mode = False  # Sind wir im Zeichen-Modus?
-        self.mask_points = []      # Liste für die 2 Punkte [(x1,y1), (x2,y2)]
-        self.mask_color = QColor(0, 255, 0, 100) # Standard: Grün, semi-transparent (Alpha=100)
+        self.drawing_mode = False
+        self.mask_points = []
+        # Initialfarbe (Grün, volle Deckkraft für den Start)
+        self.mask_color = QColor(0, 255, 0, 255) 
+        self.cad_path = None
 
-        # 1. LINKER BEREICH: VIDEO (Jetzt mit ClickableVideoLabel)
+        # 1. LINKER BEREICH: VIDEO
         self.image_label = ClickableVideoLabel(self)
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image_label.setText("Kamera wird gestartet...")
         self.image_label.setStyleSheet("border: 2px solid #444; background-color: #000;")
         self.image_label.setFixedSize(640, 480) 
-        # Klick-Signal verbinden
         self.image_label.on_click.connect(self.handle_image_click)
         
         # 2. RECHTER BEREICH: SIDEBAR
@@ -108,15 +146,14 @@ class ClientApp(QMainWindow):
             QPushButton:hover { background-color: #555; }
             QPushButton:pressed { background-color: #333; }
         """
-        btn_style_active = """
+        self.btn_style_active = """
             QPushButton {
                 background-color: #d32f2f; border-radius: 5px; 
                 padding: 10px; font-weight: bold; font-size: 14px; color: white;
             }
         """
-        self.btn_style_normal = btn_style
-        self.btn_style_active = btn_style_active
 
+        # Buttons
         self.btn_cad = QPushButton("📂 Upload CAD Model")
         self.btn_cad.setStyleSheet(btn_style)
         self.btn_cad.clicked.connect(self.upload_cad)
@@ -124,8 +161,10 @@ class ClientApp(QMainWindow):
         self.btn_color = QPushButton("🎨 Pick Color")
         self.btn_color.setStyleSheet(btn_style)
         self.btn_color.clicked.connect(self.pick_color)
+        # Initialfarbe auf den Button anwenden
+        self.btn_color.setStyleSheet(f"background-color: {self.mask_color.name()}; color: black; padding: 10px; border-radius: 5px; font-weight: bold;")
 
-        # Masken Button
+
         self.btn_mask = QPushButton("✏️ Draw Mask")
         self.btn_mask.setStyleSheet(btn_style)
         self.btn_mask.clicked.connect(self.start_drawing_mode)
@@ -135,87 +174,77 @@ class ClientApp(QMainWindow):
         self.sidebar_layout.addWidget(self.btn_color)
         self.sidebar_layout.addSpacing(10)
         self.sidebar_layout.addWidget(self.btn_mask)
-        self.sidebar_layout.addStretch() 
+        
+        self.sidebar_layout.addSpacing(20)
+        self.preview_label = QLabel("Preview:")
+        self.preview_label.setStyleSheet("font-size: 12px; color: #aaa;")
+        self.sidebar_layout.addWidget(self.preview_label)
+
+        # Das 3D Widget
+        self.cad_preview = CADPreviewWidget()
+        self.cad_preview.setMinimumSize(250, 250)
+        self.cad_preview.setStyleSheet("border: 1px solid #555;")
+        self.sidebar_layout.addWidget(self.cad_preview)
+        
+        self.sidebar_layout.addStretch()
 
         self.main_layout.addWidget(self.image_label)
+        self.main_layout.addSpacing(20)
         self.main_layout.addLayout(self.sidebar_layout)
 
-        # Thread starten
         self.thread = RealSenseThread()
         self.thread.change_pixmap_signal.connect(self.update_image)
         self.thread.start()
 
-        self.cad_path = None
-
+    # --- Logik Methoden ---
     def start_drawing_mode(self):
-        """Startet den Masken-Zeichnen Modus"""
         self.drawing_mode = True
-        self.mask_points = [] # Alte Punkte löschen
+        self.mask_points = []
         self.btn_mask.setText("Click Point 1...")
-        self.btn_mask.setStyleSheet(self.btn_style_active) # Rot färben als Indikator
+        self.btn_mask.setStyleSheet(self.btn_style_active)
 
     def handle_image_click(self, x, y):
-        """Wird aufgerufen, wenn ins Bild geklickt wird"""
-        if not self.drawing_mode:
-            return
+        if not self.drawing_mode: return
 
         self.mask_points.append((x, y))
 
         if len(self.mask_points) == 1:
-            print(f"Punkt 1 gesetzt: {x}, {y}")
             self.btn_mask.setText("Click Point 2...")
-        
         elif len(self.mask_points) == 2:
-            print(f"Punkt 2 gesetzt: {x}, {y}")
-            self.drawing_mode = False # Fertig mit Zeichnen
-            self.btn_mask.setText("✅ Mask Ready")
+            self.drawing_mode = False
+            self.btn_mask.setText("✅ Mask Ready\n(Click for new)")
             self.btn_mask.setStyleSheet("background-color: #2e7d32; padding: 10px; border-radius: 5px; font-weight: bold;")
-            # Falls man neu zeichnen will, klickt man wieder den Button
 
     def update_image(self, qt_img):
-        """Wird jeden Frame aufgerufen. Hier malen wir das Overlay drauf."""
-        
-        # 1. Bild in Pixmap umwandeln, damit wir malen können
         pixmap = QPixmap.fromImage(qt_img)
-        
-        # 2. Painter starten
         painter = QPainter(pixmap)
-        
-        # Einstellungen für den Stift (Rand) und Pinsel (Füllung)
-        pen = QPen(Qt.GlobalColor.green, 3)
+        pen = QPen(self.mask_color, 3) # Randfarbe auch anpassen
         painter.setPen(pen)
 
-        # --- Logik zum Zeichnen der Maske ---
-        if len(self.mask_points) >= 1:
-            # Ersten Punkt als kleinen Kreis malen
+        if len(self.mask_points) == 1:
             p1 = self.mask_points[0]
-            painter.setBrush(Qt.GlobalColor.green)
+            painter.setBrush(self.mask_color)
             painter.drawEllipse(QPoint(p1[0], p1[1]), 4, 4)
 
         if len(self.mask_points) == 2:
-            # Wenn beide Punkte da sind, Rechteck malen
             p1 = self.mask_points[0]
             p2 = self.mask_points[1]
+            x, y = min(p1[0], p2[0]), min(p1[1], p2[1])
+            w, h = abs(p1[0] - p2[0]), abs(p1[1] - p2[1])
             
-            # Koordinaten berechnen (oben links, breite, höhe)
-            x = min(p1[0], p2[0])
-            y = min(p1[1], p2[1])
-            w = abs(p1[0] - p2[0])
-            h = abs(p1[1] - p2[1])
+            # Temporäre Farbe mit Transparenz für die Maske erstellen
+            transparent_color = QColor(self.mask_color)
+            transparent_color.setAlpha(100)
             
-            # Rechteck füllen (Transparent)
-            painter.setBrush(QBrush(self.mask_color))
-            painter.setPen(Qt.PenStyle.NoPen) # Kein Rand für das Füll-Rechteck
+            painter.setBrush(QBrush(transparent_color))
+            painter.setPen(Qt.PenStyle.NoPen)
             painter.drawRect(x, y, w, h)
             
-            # Optional: Rand drumherum
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.setPen(QPen(Qt.GlobalColor.white, 2, Qt.PenStyle.DashLine))
             painter.drawRect(x, y, w, h)
 
         painter.end()
-
-        # 3. Das fertig bemalte Bild anzeigen
         self.image_label.setPixmap(pixmap)
 
     def upload_cad(self):
@@ -224,17 +253,32 @@ class ClientApp(QMainWindow):
             self.cad_path = file_name
             self.btn_cad.setText("✅ CAD Geladen")
             self.btn_cad.setStyleSheet("background-color: #2e7d32; padding: 10px; border-radius: 5px; font-weight: bold;")
+            
+            # --- ÄNDERUNG: Aktuelle Farbe beim Laden übergeben ---
+            self.cad_preview.load_mesh(file_name, initial_qcolor=self.mask_color)
 
     def pick_color(self):
-        color = QColorDialog.getColor()
-        if color.isValid():
-            # Farbe für die Maske aktualisieren (Transparenz wieder auf 100 setzen)
-            self.mask_color = color
-            self.mask_color.setAlpha(100) 
-            
-            self.btn_color.setStyleSheet(f"background-color: {color.name()}; color: black; padding: 10px; border-radius: 5px; font-weight: bold;")
+            # Dialog öffnen mit der aktuellen Farbe als Startwert
+            color = QColorDialog.getColor(initial=self.mask_color)
+            if color.isValid():
+                self.mask_color = color
+                
+                # --- ÄNDERUNG: Text mit Häkchen und Hintergrundfarbe ---
+                self.btn_color.setText("✅ Color Selected")
+                self.btn_color.setStyleSheet(f"""
+                    background-color: {color.name()}; 
+                    color: black; 
+                    padding: 10px; 
+                    border-radius: 5px; 
+                    font-weight: bold;
+                """)
+                
+                # Preview sofort updaten
+                self.cad_preview.update_color(self.mask_color)
 
     def closeEvent(self, event):
+        if hasattr(self, 'cad_preview'):
+            self.cad_preview.plotter.close()
         self.thread.stop()
         event.accept()
 
