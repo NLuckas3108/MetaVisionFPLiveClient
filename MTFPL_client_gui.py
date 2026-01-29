@@ -1,11 +1,13 @@
 import sys
 import cv2
+import time
 import numpy as np
 import pyrealsense2 as rs
 import zmq
+from collections import deque
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QVBoxLayout, 
                              QHBoxLayout, QWidget, QPushButton, QFileDialog, QColorDialog)
-from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QBrush
+from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QBrush, QFont
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QPoint
 
 # --- 3D Visualization ---
@@ -23,7 +25,7 @@ class ClickableVideoLabel(QLabel):
 # --- 2. Result Receiver Thread (PULL) ---
 # Muss VOR ClientApp definiert sein!
 class ResultReceiver(QThread):
-    new_result = pyqtSignal(QImage)
+    new_result = pyqtSignal(list, np.ndarray, float)
     
     def __init__(self, ip):
         super().__init__()
@@ -37,15 +39,14 @@ class ResultReceiver(QThread):
         while self.running:
             try:
                 packet = self.socket.recv_pyobj()
-                img_data = packet["image"]
                 
-                # Konvertierung für QT
-                rgb_image = cv2.cvtColor(img_data, cv2.COLOR_BGR2RGB)
-                h, w, ch = rgb_image.shape
-                bytes_per_line = ch * w
-                qt_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+                if "box_points" in packet and "pose" in packet:
+                    points = packet["box_points"]
+                    pose = packet["pose"]
+                    timestamp = packet.get("timestamp", 0)
+                    
+                    self.new_result.emit(points, pose, timestamp)
                 
-                self.new_result.emit(qt_img)
             except zmq.Again:
                 continue
             except Exception:
@@ -66,19 +67,17 @@ class RealSenseThread(QThread):
         self.pipeline = None
         
         # ZMQ Video Connection (PUSH Socket!)
-        self.server_ip = "192.168.10.52" # <--- IP PRÜFEN!
+        self.server_ip = "192.168.10.52" 
         self.context = zmq.Context()
-        self.video_socket = self.context.socket(zmq.PUSH) # PUSH für Fire & Forget
+        self.video_socket = self.context.socket(zmq.PUSH) 
         self.video_socket.connect(f"tcp://{self.server_ip}:5556")
-        
-        # WICHTIG: Queue extrem klein halten (High Water Mark).
         self.video_socket.setsockopt(zmq.SNDHWM, 1) 
 
     def run(self):
         self.pipeline = rs.pipeline()
         config = rs.config()
-        config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-        config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+        config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 60)
+        config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 60)
 
         try:
             self.pipeline.start(config)
@@ -97,25 +96,30 @@ class RealSenseThread(QThread):
                 # --- 1. NETZWERK SENDEN (Asynchron) ---
                 if self.tracking_active:
                     try:
-                        # flags=zmq.NOBLOCK ist entscheidend!
-                        payload = {"rgb": cv_img, "depth": depth_img}
+                        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+                        _, rgb_encoded = cv2.imencode('.jpg', cv_img, encode_param)
+                        
+                        payload = {
+                            "rgb_compressed": rgb_encoded,
+                            "depth": depth_img 
+                        }
                         self.video_socket.send_pyobj(payload, flags=zmq.NOBLOCK)
                     except zmq.Again:
-                        pass # Puffer voll, Frame droppen
-                    except Exception as e:
-                        print(f"[ERROR] ZMQ Send: {e}")
+                        pass 
 
                 # --- 2. LOKALE ANZEIGE ---
-                # Nur anzeigen, wenn wir NICHT tracken. Sonst kommt Bild vom Server.
-                if not self.tracking_active:
-                    rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
-                    h, w, ch = rgb_image.shape
-                    bytes_per_line = ch * w
-                    
-                    qt_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-                    p = qt_img.scaled(640, 480, Qt.AspectRatioMode.IgnoreAspectRatio)
-                    
-                    self.change_pixmap_signal.emit(p)
+                # WICHTIG: Das Bild muss IMMER angezeigt werden, da der Server
+                # nur noch Punkte schickt, kein Bild mehr!
+                # Wir entfernen das "if not self.tracking_active"!
+                
+                rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+                h, w, ch = rgb_image.shape
+                bytes_per_line = ch * w
+                
+                qt_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+                p = qt_img.scaled(640, 480, Qt.AspectRatioMode.IgnoreAspectRatio)
+                
+                self.change_pixmap_signal.emit(p)
 
         except Exception as e:
             print(f"[ERROR] Pipeline: {e}")
@@ -168,8 +172,14 @@ class ClientApp(QMainWindow):
         self.setWindowTitle("FoundationPose Client")
         self.setGeometry(100, 100, 1000, 650)
         self.setStyleSheet("background-color: #2b2b2b; color: white;")
+        
+        # Variablen Init
+        self.current_box_points = None
+        self.fps_buffer = deque()
+        self.pose_log = []     
+        self.image_counter = 0
 
-        # ZMQ Command Setup (Bleibt Synchron REQ-REP)
+        # ZMQ Command Setup
         self.server_ip = "192.168.10.52"
         self.context = zmq.Context()
         self.cmd_socket = self.context.socket(zmq.REQ)
@@ -182,7 +192,7 @@ class ClientApp(QMainWindow):
         self.status_mask = False
         self.drawing_mode = False
         self.mask_points = []
-        self.mask_color = QColor(0, 255, 0, 255) 
+        self.mask_color = QColor(0, 255, 0, 255)
 
         # UI Setup
         self.central_widget = QWidget()
@@ -199,6 +209,7 @@ class ClientApp(QMainWindow):
         
         btn_style = "QPushButton { background-color: #444; border-radius: 5px; padding: 10px; font-weight: bold; }"
         
+        # --- BUTTONS ERSTELLEN (Aber noch NICHT zum Layout hinzufügen!) ---
         self.btn_cad = QPushButton("1. 📂 Upload CAD Model")
         self.btn_cad.setStyleSheet(btn_style)
         self.btn_cad.clicked.connect(self.upload_cad)
@@ -211,7 +222,6 @@ class ClientApp(QMainWindow):
         self.btn_mask.setStyleSheet(btn_style)
         self.btn_mask.clicked.connect(self.start_drawing_mode)
 
-        self.sidebar_layout.addSpacing(20)
         self.btn_start = QPushButton("🚀 Start Tracking")
         self.style_disabled = "background-color: #555; color: #888; border-radius: 5px; padding: 15px; font-weight: bold; font-size: 16px;"
         self.style_start = "background-color: #2196F3; color: white; border-radius: 5px; padding: 15px; font-weight: bold; font-size: 16px;"
@@ -221,29 +231,46 @@ class ClientApp(QMainWindow):
         self.btn_start.setEnabled(False) 
         self.btn_start.clicked.connect(self.toggle_tracking)
 
+        # Log Button erstellen (Hier war der Fehler: addWidget entfernt!)
+        self.btn_log = QPushButton("💾 Download Log")
+        self.btn_log.setStyleSheet(self.style_disabled)
+        self.btn_log.setEnabled(False)
+        self.btn_log.clicked.connect(self.save_log_file)
+        
         self.cad_preview = CADPreviewWidget()
         self.cad_preview.setMinimumSize(200, 200)
 
+        # --- LAYOUT ZUSAMMENBAUEN (Hier passiert die Reihenfolge) ---
         self.sidebar_layout.addWidget(self.btn_cad)
         self.sidebar_layout.addWidget(self.btn_color)
         self.sidebar_layout.addWidget(self.btn_mask)
+        
+        self.sidebar_layout.addSpacing(20) # Abstand
         self.sidebar_layout.addWidget(self.btn_start)
+        
+        # Log Button DIREKT unter Start Button
+        self.sidebar_layout.addSpacing(10)
+        self.sidebar_layout.addWidget(self.btn_log)
+        
+        self.sidebar_layout.addStretch() # Drückt alles nach oben
+        
         self.sidebar_layout.addWidget(QLabel("Preview:"))
         self.sidebar_layout.addWidget(self.cad_preview)
-        self.sidebar_layout.addStretch()
 
         self.main_layout.addWidget(self.image_label)
         self.main_layout.addLayout(self.sidebar_layout)
 
-        # 1. Thread: Kamera (Producer)
+        # Threads
         self.thread = RealSenseThread()
-        self.thread.change_pixmap_signal.connect(self.update_image) # Lokales Bild
+        self.thread.change_pixmap_signal.connect(self.update_image) 
         self.thread.start()
 
-        # 2. Thread: Ergebnis (Consumer)
         self.result_receiver = ResultReceiver(self.thread.server_ip)
-        self.result_receiver.new_result.connect(self.update_image) # Server Bild
+        self.result_receiver.new_result.connect(self.update_box_points) 
         self.result_receiver.start()
+
+        self.pose_log = []     # Liste für die gesammelten Daten
+        self.image_counter = 0
 
     def check_ready_status(self):
         if self.thread.tracking_active: return 
@@ -257,34 +284,56 @@ class ClientApp(QMainWindow):
             self.btn_start.setStyleSheet(self.style_disabled)
 
     def toggle_tracking(self):
-        """Schaltet Tracking AN oder AUS und resettet den Server"""
         if not self.thread.tracking_active:
             # --- STARTEN ---
+            self.pose_log = []     
+            self.image_counter = 0 
+            self.btn_log.setEnabled(False) 
+            self.btn_log.setStyleSheet(self.style_disabled)
+            
             self.thread.tracking_active = True
             self.btn_start.setText("🛑 Stop Tracking")
             self.btn_start.setStyleSheet(self.style_stop)
+            
+            # GUI während Tracking sperren (optional, aber sauberer)
+            self.btn_cad.setEnabled(False)
+            self.btn_mask.setEnabled(False)
+            self.btn_color.setEnabled(False)
+
         else:
             # --- STOPPEN ---
             self.thread.tracking_active = False
             self.btn_start.setText("🚀 Start Tracking")
-            self.btn_start.setStyleSheet(self.style_start)
+            # Button wird durch check_ready_status gleich eh disabled/gestyled
             
-            # NEU: Server Reset befehlen
-            print("[CLIENT] Sende STOP an Server...")
+            # Buttons wieder freigeben
+            self.btn_cad.setEnabled(True)
+            self.btn_mask.setEnabled(True)
+            self.btn_color.setEnabled(True)
+            
+            # Download Button aktivieren
+            self.btn_log.setEnabled(True)
+            self.btn_log.setStyleSheet("background-color: #f57c00; color: white; border-radius: 5px; padding: 15px; font-weight: bold;")
+
+            # --- WICHTIG: RESET STATE ---
+            # Wir löschen den Masken-Status. Das zwingt den User,
+            # eine neue Maske zu zeichnen (was INIT sendet).
+            print("[CLIENT] Resetting Mask State...")
+            self.status_mask = False
+            self.mask_points = []
+            self.btn_mask.setText("3. ✏️ Draw Mask")
+            # Style zurücksetzen auf Grau
+            self.btn_mask.setStyleSheet("QPushButton { background-color: #444; border-radius: 5px; padding: 10px; font-weight: bold; }")
+            
+            # Start-Button deaktivieren (weil Maske fehlt)
+            self.check_ready_status()
+            # -----------------------------
+
+            # STOP an Server senden
             try:
-                # Wir nutzen den synchronen CMD Socket
                 self.cmd_socket.send_pyobj({"cmd": "STOP"})
                 resp = self.cmd_socket.recv_string()
-                
-                if resp == "OK":
-                    print("[CLIENT] Server erfolgreich resettet.")
-                    # Optional: Status Flags zurücksetzen, falls man
-                    # gezwungen werden soll, neu zu maskieren:
-                    # self.status_mask = False
-                    # self.check_ready_status()
-                else:
-                    print(f"[CLIENT] Server Warnung: {resp}")
-                    
+                print(f"[CLIENT] Server Stop: {resp}")
             except Exception as e:
                 print(f"[CLIENT] Fehler beim Stoppen: {e}")
 
@@ -343,10 +392,36 @@ class ClientApp(QMainWindow):
         self.check_ready_status()
 
     def update_image(self, qt_img):
+        # 1. FPS Berechnung
+        now = time.time()
+        self.fps_buffer.append(now)
+        while self.fps_buffer and self.fps_buffer[0] < now - 1.0:
+            self.fps_buffer.popleft()
+        current_fps = len(self.fps_buffer)
+
+        # 2. Bild vorbereiten
         pixmap = QPixmap.fromImage(qt_img)
-        # Zeichne Maske nur, wenn wir gerade zeichnen oder nicht tracken
+        painter = QPainter(pixmap)
+        
+        # 3. 3D BOX ZEICHNEN
+        # Wir malen über das lokale Bild, wenn Punkte vom Server da sind
+        if self.thread.tracking_active and self.current_box_points:
+            painter.setPen(QPen(QColor(0, 255, 0), 3)) # Grün, Dicke 3
+            pts = self.current_box_points
+            
+            if len(pts) == 8:
+                lines = [
+                    (0,1), (1,3), (3,2), (2,0), # Front
+                    (4,5), (5,7), (7,6), (6,4), # Back
+                    (0,4), (1,5), (2,6), (3,7)  # Connecting
+                ]
+                for p1_idx, p2_idx in lines:
+                    p1 = pts[p1_idx]
+                    p2 = pts[p2_idx]
+                    painter.drawLine(p1[0], p1[1], p2[0], p2[1])
+
+        # 4. MASKE ZEICHNEN (während Setup)
         if not self.thread.tracking_active or self.drawing_mode:
-            painter = QPainter(pixmap)
             if len(self.mask_points) == 1:
                 painter.setBrush(self.mask_color)
                 painter.drawEllipse(QPoint(self.mask_points[0][0], self.mask_points[0][1]), 4, 4)
@@ -357,8 +432,29 @@ class ClientApp(QMainWindow):
                 m_color = QColor(self.mask_color); m_color.setAlpha(100)
                 painter.setBrush(m_color)
                 painter.drawRect(x, y, w, h)
-            painter.end()
+        
+        # 5. FPS ANZEIGE ZEICHNEN
+        if self.thread.tracking_active:
+            painter.setPen(QColor("yellow"))
+            painter.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+            painter.drawText(10, 30, f"FPS: {current_fps}")
+
+        painter.end()
         self.image_label.setPixmap(pixmap)
+
+    def update_box_points(self, points, pose, timestamp):
+        # 1. Visualisierung (wie gehabt)
+        self.current_box_points = points
+        
+        # 2. Logging (Nur wenn Tracking läuft)
+        if self.thread.tracking_active:
+            self.image_counter += 1
+            # Wir speichern die Rohdaten und formatieren erst beim Speichern (spart Zeit)
+            self.pose_log.append({
+                "id": self.image_counter,
+                "ts": timestamp,
+                "pose": pose
+            })
 
     def pick_color(self):
         color = QColorDialog.getColor(initial=self.mask_color)
@@ -369,6 +465,43 @@ class ClientApp(QMainWindow):
             self.cad_preview.update_color(self.mask_color)
             self.status_color = True
             self.check_ready_status()
+
+    def save_log_file(self):
+        if not self.pose_log:
+            print("Keine Daten zum Speichern.")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(self, "Log speichern", "tracking.log", "Log Files (*.log)")
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, "w") as f:
+                for entry in self.pose_log:
+                    f.write(f"Image: {entry['id']}\n")
+                    
+                    # --- TIMESTAMP KORREKTUR ---
+                    ts = entry['ts'] # Das ist jetzt ein Float (z.B. 1768375331.189)
+                    
+                    seconds = int(ts) # Der Teil vor dem Komma
+                    # Der Teil nach dem Komma * 1 Milliarde
+                    nanos = int((ts - seconds) * 1_000_000_000)
+                    
+                    f.write(f"Timestamp: {seconds}_{nanos:09d}\n") # :09d füllt führende Nullen auf
+                    # ---------------------------
+                    
+                    pose = entry['pose']
+                    for row in pose:
+                        line = "".join([f"[{x: .15f}] " for x in row])
+                        f.write(line.strip() + "\n")
+                    
+                    f.write("\n")
+            
+            print(f"Log gespeichert: {file_path}")
+            self.btn_log.setText("✅ Saved")
+            
+        except Exception as e:
+            print(f"Fehler beim Speichern: {e}")
 
     def closeEvent(self, event):
         self.thread.stop()
