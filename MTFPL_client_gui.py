@@ -132,6 +132,8 @@ class ResultReceiver(QThread):
 # Klasse die die Kamerabilder aufnimmt und verarbeitet
 class RealSenseThread(QThread):
     change_pixmap_signal = pyqtSignal(QImage)
+    connection_error_signal = pyqtSignal(str)
+    intrinsics_signal = pyqtSignal(object)
 
     def __init__(self, server_ip):
         super().__init__()
@@ -153,8 +155,11 @@ class RealSenseThread(QThread):
         config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 60)
 
         try:
-            self.pipeline.start(config)
+            profile = self.pipeline.start(config)
             print(f"[CLIENT] Kamera läuft. Sende an {self.server_ip}")
+            intr = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+            K = np.array([[intr.fx, 0, intr.ppx], [0, intr.fy, intr.ppy], [0, 0, 1]])
+            self.intrinsics_signal.emit(K)
             
             while self._run_flag:
                 frames = self.pipeline.wait_for_frames()
@@ -192,8 +197,12 @@ class RealSenseThread(QThread):
                 p = qt_img.scaled(640, 480, Qt.AspectRatioMode.IgnoreAspectRatio)
                 self.change_pixmap_signal.emit(p)
 
+        except RuntimeError as e: # RealSense spezifischer Fehler
+            print(f"[ERROR] RealSense: {e}")
+            self.connection_error_signal.emit("Keine RealSense Kamera gefunden!\nBitte anschließen.")
         except Exception as e:
             print(f"[ERROR] Pipeline: {e}")
+            self.connection_error_signal.emit(f"Kamera Fehler: {e}")
         finally:
             self.stop_pipeline()
             self.video_socket.close()
@@ -246,6 +255,8 @@ class ClientApp(QMainWindow):
         self.setStyleSheet("background-color: #2b2b2b; color: white;")
         
         self.current_box_points = None
+        self.current_pose = None
+        self.K = None
         self.tracking_fps_buffer = deque()
         self.tracking_fps = 0
         self.pose_log = []      
@@ -324,7 +335,9 @@ class ClientApp(QMainWindow):
 
         # Threads
         self.thread = RealSenseThread(self.server_ip)
-        self.thread.change_pixmap_signal.connect(self.update_image) 
+        self.thread.change_pixmap_signal.connect(self.update_image)
+        self.thread.connection_error_signal.connect(self.show_camera_error)
+        self.thread.intrinsics_signal.connect(self.set_intrinsics)
         self.thread.start()
 
         self.result_receiver = ResultReceiver(self.server_ip)
@@ -333,6 +346,14 @@ class ClientApp(QMainWindow):
 
         self.pose_log = []     
         self.image_counter = 0
+
+    def show_camera_error(self, msg):
+        QMessageBox.critical(self, "Kamera Fehler", msg)
+        self.close()
+
+    def set_intrinsics(self, K):
+        self.K = K
+        print(f"[CLIENT] Intrinsics erhalten:\n{self.K}")
     
     def check_ready_status(self):
         if self.thread.tracking_active: return 
@@ -428,9 +449,47 @@ class ClientApp(QMainWindow):
         self.status_mask = False 
         self.check_ready_status()
 
+    def project_point(self, p_3d, pose, K):
+        if pose is None or K is None: return None
+        R = pose[:3, :3]; t = pose[:3, 3]
+        p_cam = (R @ p_3d) + t
+        
+        if p_cam[2] <= 0.001: return None
+        p_img = K @ p_cam
+        u = int(p_img[0] / p_img[2])
+        v = int(p_img[1] / p_img[2])
+        return (u, v)
+
     def update_image(self, qt_img):
         pixmap = QPixmap.fromImage(qt_img)
         painter = QPainter(pixmap)
+        if self.thread.tracking_active and self.current_box_points:
+            painter.setPen(QPen(QColor(0, 255, 0), 2))
+            pts = self.current_box_points
+            if len(pts) == 8:
+                lines = [(0,1), (1,3), (3,2), (2,0), (4,5), (5,7), (7,6), (6,4), (0,4), (1,5), (2,6), (3,7)]
+                for p1_idx, p2_idx in lines:
+                    p1 = pts[p1_idx]; p2 = pts[p2_idx]
+                    painter.drawLine(p1[0], p1[1], p2[0], p2[1])
+        if self.thread.tracking_active and self.current_pose is not None and self.K is not None:
+            axis_len = 0.1 # 10 cm Achsenlänge
+            origin = np.array([0.0, 0.0, 0.0])
+            x_axis = np.array([axis_len, 0.0, 0.0])
+            y_axis = np.array([0.0, axis_len, 0.0])
+            z_axis = np.array([0.0, 0.0, axis_len])
+            
+            p_org = self.project_point(origin, self.current_pose, self.K)
+            p_x = self.project_point(x_axis, self.current_pose, self.K)
+            p_y = self.project_point(y_axis, self.current_pose, self.K)
+            p_z = self.project_point(z_axis, self.current_pose, self.K)
+            
+            if p_org and p_x and p_y and p_z:
+                painter.setPen(QPen(QColor(255, 0, 0), 3))
+                painter.drawLine(p_org[0], p_org[1], p_x[0], p_x[1])
+                painter.setPen(QPen(QColor(0, 255, 0), 3))
+                painter.drawLine(p_org[0], p_org[1], p_y[0], p_y[1])
+                painter.setPen(QPen(QColor(0, 0, 255), 3))
+                painter.drawLine(p_org[0], p_org[1], p_z[0], p_z[1])
         if self.thread.tracking_active and self.current_box_points:
             painter.setPen(QPen(QColor(0, 255, 0), 3))
             pts = self.current_box_points
@@ -455,6 +514,7 @@ class ClientApp(QMainWindow):
 
     def update_box_points(self, points, pose, timestamp):
         self.current_box_points = points
+        self.current_pose = pose
         now = time.time()
         self.tracking_fps_buffer.append(now)
         while self.tracking_fps_buffer and self.tracking_fps_buffer[0] < now - 1.0:
