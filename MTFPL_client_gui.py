@@ -4,6 +4,7 @@ import time
 import numpy as np
 import pyrealsense2 as rs
 import zmq
+import zlib
 from collections import deque
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QVBoxLayout, 
                              QHBoxLayout, QWidget, QPushButton, QFileDialog, QColorDialog)
@@ -100,10 +101,15 @@ class RealSenseThread(QThread):
                     try:
                         encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
                         _, rgb_encoded = cv2.imencode('.jpg', cv_img, encode_param)
+
+                        depth_bytes = depth_img.tobytes()
+                        depth_compressed = zlib.compress(depth_bytes, level=1)
                         
                         payload = {
                             "rgb_compressed": rgb_encoded,
-                            "depth": depth_img 
+                            "depth_compressed": depth_compressed, # Neu
+                            "shape": depth_img.shape,             # Wichtig für Rekonstruktion
+                            "dtype": str(depth_img.dtype)         # Meistens 'uint16'
                         }
                         self.video_socket.send_pyobj(payload, flags=zmq.NOBLOCK)
                     except zmq.Again:
@@ -177,8 +183,12 @@ class ClientApp(QMainWindow):
         
         # Variablen Init
         self.current_box_points = None
-        self.fps_buffer = deque()
-        self.pose_log = []     
+        
+        # NEU: Buffer für Tracking FPS (nicht Kamera FPS)
+        self.tracking_fps_buffer = deque()
+        self.tracking_fps = 0
+        
+        self.pose_log = []      
         self.image_counter = 0
 
         # ZMQ Command Setup
@@ -211,7 +221,7 @@ class ClientApp(QMainWindow):
         
         btn_style = "QPushButton { background-color: #444; border-radius: 5px; padding: 10px; font-weight: bold; }"
         
-        # --- BUTTONS ERSTELLEN (Aber noch NICHT zum Layout hinzufügen!) ---
+        # --- BUTTONS ---
         self.btn_cad = QPushButton("1. 📂 Upload CAD Model")
         self.btn_cad.setStyleSheet(btn_style)
         self.btn_cad.clicked.connect(self.upload_cad)
@@ -233,7 +243,7 @@ class ClientApp(QMainWindow):
         self.btn_start.setEnabled(False) 
         self.btn_start.clicked.connect(self.toggle_tracking)
 
-        # Log Button erstellen (Hier war der Fehler: addWidget entfernt!)
+        # Log Button
         self.btn_log = QPushButton("💾 Download Log")
         self.btn_log.setStyleSheet(self.style_disabled)
         self.btn_log.setEnabled(False)
@@ -242,19 +252,18 @@ class ClientApp(QMainWindow):
         self.cad_preview = CADPreviewWidget()
         self.cad_preview.setMinimumSize(200, 200)
 
-        # --- LAYOUT ZUSAMMENBAUEN (Hier passiert die Reihenfolge) ---
+        # --- LAYOUT ---
         self.sidebar_layout.addWidget(self.btn_cad)
         self.sidebar_layout.addWidget(self.btn_color)
         self.sidebar_layout.addWidget(self.btn_mask)
         
-        self.sidebar_layout.addSpacing(20) # Abstand
+        self.sidebar_layout.addSpacing(20)
         self.sidebar_layout.addWidget(self.btn_start)
         
-        # Log Button DIREKT unter Start Button
         self.sidebar_layout.addSpacing(10)
         self.sidebar_layout.addWidget(self.btn_log)
         
-        self.sidebar_layout.addStretch() # Drückt alles nach oben
+        self.sidebar_layout.addStretch()
         
         self.sidebar_layout.addWidget(QLabel("Preview:"))
         self.sidebar_layout.addWidget(self.cad_preview)
@@ -271,7 +280,7 @@ class ClientApp(QMainWindow):
         self.result_receiver.new_result.connect(self.update_box_points) 
         self.result_receiver.start()
 
-        self.pose_log = []     # Liste für die gesammelten Daten
+        self.pose_log = []     
         self.image_counter = 0
 
     def check_ready_status(self):
@@ -288,8 +297,11 @@ class ClientApp(QMainWindow):
     def toggle_tracking(self):
         if not self.thread.tracking_active:
             # --- STARTEN ---
-            self.pose_log = []     
+            self.pose_log = []      
             self.image_counter = 0 
+            self.tracking_fps_buffer.clear() # Buffer leeren
+            self.tracking_fps = 0
+            
             self.btn_log.setEnabled(False) 
             self.btn_log.setStyleSheet(self.style_disabled)
             
@@ -297,7 +309,6 @@ class ClientApp(QMainWindow):
             self.btn_start.setText("🛑 Stop Tracking")
             self.btn_start.setStyleSheet(self.style_stop)
             
-            # GUI während Tracking sperren (optional, aber sauberer)
             self.btn_cad.setEnabled(False)
             self.btn_mask.setEnabled(False)
             self.btn_color.setEnabled(False)
@@ -305,33 +316,29 @@ class ClientApp(QMainWindow):
         else:
             # --- STOPPEN ---
             self.thread.tracking_active = False
-            self.btn_start.setText("🚀 Start Tracking")
-            # Button wird durch check_ready_status gleich eh disabled/gestyled
             
-            # Buttons wieder freigeben
+            # 1. FIX: Ghost Box entfernen
+            self.current_box_points = None
+            self.tracking_fps = 0 # FPS Reset
+            
+            self.btn_start.setText("🚀 Start Tracking")
+            
             self.btn_cad.setEnabled(True)
             self.btn_mask.setEnabled(True)
             self.btn_color.setEnabled(True)
             
-            # Download Button aktivieren
             self.btn_log.setEnabled(True)
             self.btn_log.setStyleSheet("background-color: #f57c00; color: white; border-radius: 5px; padding: 15px; font-weight: bold;")
 
-            # --- WICHTIG: RESET STATE ---
-            # Wir löschen den Masken-Status. Das zwingt den User,
-            # eine neue Maske zu zeichnen (was INIT sendet).
+            # RESET STATE
             print("[CLIENT] Resetting Mask State...")
             self.status_mask = False
             self.mask_points = []
             self.btn_mask.setText("3. ✏️ Draw Mask")
-            # Style zurücksetzen auf Grau
             self.btn_mask.setStyleSheet("QPushButton { background-color: #444; border-radius: 5px; padding: 10px; font-weight: bold; }")
             
-            # Start-Button deaktivieren (weil Maske fehlt)
             self.check_ready_status()
-            # -----------------------------
 
-            # STOP an Server senden
             try:
                 self.cmd_socket.send_pyobj({"cmd": "STOP"})
                 resp = self.cmd_socket.recv_string()
@@ -386,6 +393,10 @@ class ClientApp(QMainWindow):
     def start_drawing_mode(self):
         if self.thread.tracking_active:
             self.toggle_tracking()
+        
+        # Sicherstellen, dass keine alte Box gezeichnet wird
+        self.current_box_points = None 
+        
         self.drawing_mode = True
         self.mask_points = []
         self.btn_mask.setText("Click Point 1...")
@@ -394,35 +405,27 @@ class ClientApp(QMainWindow):
         self.check_ready_status()
 
     def update_image(self, qt_img):
-        # 1. FPS Berechnung
-        now = time.time()
-        self.fps_buffer.append(now)
-        while self.fps_buffer and self.fps_buffer[0] < now - 1.0:
-            self.fps_buffer.popleft()
-        current_fps = len(self.fps_buffer)
-
-        # 2. Bild vorbereiten
+        # 2. Bild vorbereiten (FPS Berechnung ist jetzt in update_box_points)
         pixmap = QPixmap.fromImage(qt_img)
         painter = QPainter(pixmap)
         
         # 3. 3D BOX ZEICHNEN
-        # Wir malen über das lokale Bild, wenn Punkte vom Server da sind
         if self.thread.tracking_active and self.current_box_points:
-            painter.setPen(QPen(QColor(0, 255, 0), 3)) # Grün, Dicke 3
+            painter.setPen(QPen(QColor(0, 255, 0), 3))
             pts = self.current_box_points
             
             if len(pts) == 8:
                 lines = [
-                    (0,1), (1,3), (3,2), (2,0), # Front
-                    (4,5), (5,7), (7,6), (6,4), # Back
-                    (0,4), (1,5), (2,6), (3,7)  # Connecting
+                    (0,1), (1,3), (3,2), (2,0),
+                    (4,5), (5,7), (7,6), (6,4),
+                    (0,4), (1,5), (2,6), (3,7) 
                 ]
                 for p1_idx, p2_idx in lines:
                     p1 = pts[p1_idx]
                     p2 = pts[p2_idx]
                     painter.drawLine(p1[0], p1[1], p2[0], p2[1])
 
-        # 4. MASKE ZEICHNEN (während Setup)
+        # 4. MASKE ZEICHNEN
         if not self.thread.tracking_active or self.drawing_mode:
             if len(self.mask_points) == 1:
                 painter.setBrush(self.mask_color)
@@ -435,23 +438,29 @@ class ClientApp(QMainWindow):
                 painter.setBrush(m_color)
                 painter.drawRect(x, y, w, h)
         
-        # 5. FPS ANZEIGE ZEICHNEN
+        # 5. FPS ANZEIGE ZEICHNEN (Nimmt jetzt die Variable aus dem Network Thread)
         if self.thread.tracking_active:
             painter.setPen(QColor("yellow"))
             painter.setFont(QFont("Arial", 14, QFont.Weight.Bold))
-            painter.drawText(10, 30, f"FPS: {current_fps}")
+            painter.drawText(10, 30, f"FPS: {self.tracking_fps}")
 
         painter.end()
         self.image_label.setPixmap(pixmap)
 
     def update_box_points(self, points, pose, timestamp):
-        # 1. Visualisierung (wie gehabt)
+        # 1. Visualisierung
         self.current_box_points = points
         
-        # 2. Logging (Nur wenn Tracking läuft)
+        # 2. NEU: Echte FPS Berechnung (Pakete pro Sekunde)
+        now = time.time()
+        self.tracking_fps_buffer.append(now)
+        while self.tracking_fps_buffer and self.tracking_fps_buffer[0] < now - 1.0:
+            self.tracking_fps_buffer.popleft()
+        self.tracking_fps = len(self.tracking_fps_buffer)
+        
+        # 3. Logging
         if self.thread.tracking_active:
             self.image_counter += 1
-            # Wir speichern die Rohdaten und formatieren erst beim Speichern (spart Zeit)
             self.pose_log.append({
                 "id": self.image_counter,
                 "ts": timestamp,
@@ -482,15 +491,11 @@ class ClientApp(QMainWindow):
                 for entry in self.pose_log:
                     f.write(f"Image: {entry['id']}\n")
                     
-                    # --- TIMESTAMP KORREKTUR ---
-                    ts = entry['ts'] # Das ist jetzt ein Float (z.B. 1768375331.189)
-                    
-                    seconds = int(ts) # Der Teil vor dem Komma
-                    # Der Teil nach dem Komma * 1 Milliarde
+                    ts = entry['ts']
+                    seconds = int(ts)
                     nanos = int((ts - seconds) * 1_000_000_000)
                     
-                    f.write(f"Timestamp: {seconds}_{nanos:09d}\n") # :09d füllt führende Nullen auf
-                    # ---------------------------
+                    f.write(f"Timestamp: {seconds}_{nanos:09d}\n")
                     
                     pose = entry['pose']
                     for row in pose:
