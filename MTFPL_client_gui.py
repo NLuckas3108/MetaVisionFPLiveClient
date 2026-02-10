@@ -99,7 +99,7 @@ class RealSenseThread(QThread):
                 # --- 1. NETZWERK SENDEN (Asynchron) ---
                 if self.tracking_active:
                     try:
-                        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+                        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 50]
                         _, rgb_encoded = cv2.imencode('.jpg', cv_img, encode_param)
 
                         depth_bytes = depth_img.tobytes()
