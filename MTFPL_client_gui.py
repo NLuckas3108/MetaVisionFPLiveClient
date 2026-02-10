@@ -65,6 +65,7 @@ class RealSenseThread(QThread):
         self._run_flag = True
         self.tracking_active = False 
         self.pipeline = None
+        self.align = rs.align(rs.stream.color)
         
         # ZMQ Video Connection (PUSH Socket!)
         self.server_ip = "192.168.10.52" 
@@ -85,8 +86,9 @@ class RealSenseThread(QThread):
             
             while self._run_flag:
                 frames = self.pipeline.wait_for_frames()
-                color_frame = frames.get_color_frame()
-                depth_frame = frames.get_depth_frame()
+                aligned_frames = self.align.process(frames)
+                color_frame = aligned_frames.get_color_frame()
+                depth_frame = aligned_frames.get_depth_frame()
                 
                 if not color_frame or not depth_frame: continue
 
