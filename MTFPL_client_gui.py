@@ -14,16 +14,22 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QVBoxLayout,
 from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QFont, QIcon
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QPoint, QSize
 
-# --- 3D Visualization ---
 import pyvista as pv
 from pyvistaqt import QtInteractor
 
-# --- Dialog zur Textur-Auswahl ---
+def resource_path(relative_path):
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
 class TextureSelectorDialog(QDialog):
     def __init__(self, texture_list, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Textur wählen")
         self.setFixedSize(600, 400)
+        self.setStyleSheet("background-color: #333; color: white;")
         self.selected_texture_name = None
         self.selected_texture_bytes = None 
         
@@ -36,6 +42,7 @@ class TextureSelectorDialog(QDialog):
         self.list_widget.setResizeMode(QListWidget.ResizeMode.Adjust)
         self.list_widget.setSpacing(10)
         self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.list_widget.setStyleSheet("background-color: #444; border: 1px solid #666;")
         
         self.tex_data_map = {}
 
@@ -56,12 +63,12 @@ class TextureSelectorDialog(QDialog):
         layout.addWidget(self.list_widget)
         
         btn_select = QPushButton("Auswählen")
+        btn_select.setStyleSheet("background-color: #00549F; color: white; padding: 10px; font-weight: bold;")
         btn_select.clicked.connect(self.accept_selection)
         layout.addWidget(btn_select)
 
     def accept_selection(self, arg=None):
         item = None
-        
         if isinstance(arg, QListWidgetItem):
             item = arg
         else:
@@ -275,9 +282,7 @@ class CADPreviewWidget(QWidget):
                 self.mesh_actor.mapper.dataset = mapped_mesh
                 self.mesh_actor.texture = tex
                 self.mesh_actor.prop.color = "white"
-                
                 self.plotter.render()
-                
             except Exception as e:
                 print(f"[ERROR] Preview Texture Error: {e}")
 
@@ -285,10 +290,49 @@ class ClientApp(QMainWindow):
     def __init__(self, server_ip):
         super().__init__()
         self.server_ip = server_ip 
-        self.setWindowTitle(f"FoundationPose Client (Connected to {server_ip})")
-        self.setGeometry(100, 100, 1000, 650)
-        self.setStyleSheet("background-color: #2b2b2b; color: white;")
         
+        self.setWindowTitle(f"MetaVision Client (Connected to {server_ip})")
+        logo_path = resource_path(os.path.join("logo", "logo_weiss.png"))
+        self.setWindowIcon(QIcon(logo_path))
+        self.setGeometry(100, 100, 1000, 650)
+        
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: rgb(0, 84, 159);
+            }
+            QWidget {
+                background-color: rgb(0, 84, 159);
+                color: white;
+            }
+            QLabel {
+                background-color: transparent;
+                color: white;
+            }
+        """)
+        
+        self.btn_style_unified = """
+            QPushButton { 
+                background-color: rgb(100, 130, 160); 
+                color: white;
+                border: 1px solid rgba(255,255,255,0.2);
+                border-radius: 5px; 
+                padding: 10px; 
+                font-weight: bold; 
+            }
+            QPushButton:hover {
+                background-color: rgb(120, 150, 180);
+            }
+            QPushButton:pressed {
+                background-color: rgb(0, 70, 130);
+            }
+            /* Damit man sieht, wenn etwas noch nicht klickbar ist */
+            QPushButton:disabled {
+                background-color: rgba(255, 255, 255, 0.1);
+                color: #888;
+                border: 1px solid transparent;
+            }
+        """
+
         self.current_box_points = None
         self.current_pose = None
         self.K = None
@@ -296,7 +340,6 @@ class ClientApp(QMainWindow):
         self.tracking_fps = 0
         self.pose_log = []      
         self.image_counter = 0
-
         self.texture_cache = None
 
         self.context = zmq.Context()
@@ -315,29 +358,39 @@ class ClientApp(QMainWindow):
         self.setCentralWidget(self.central_widget)
         self.main_layout = QHBoxLayout(self.central_widget)
 
+        self.left_container = QWidget()
+        self.left_layout = QVBoxLayout(self.left_container)
+        self.left_layout.setContentsMargins(0, 0, 0, 0)
+
         self.image_label = ClickableVideoLabel(self)
         self.image_label.setFixedSize(640, 480)
-        self.image_label.setStyleSheet("border: 2px solid #444; background-color: #000;")
+        self.image_label.setStyleSheet("border: 2px solid white; background-color: #000;")
         self.image_label.on_click.connect(self.handle_image_click)
+        self.left_layout.addWidget(self.image_label)
 
+        self.logo_label = QLabel()
+        if os.path.exists(logo_path):
+            pix = QPixmap(logo_path)
+            self.logo_label.setPixmap(pix.scaledToHeight(60, Qt.TransformationMode.SmoothTransformation))
+        self.logo_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom)
+        self.left_layout.addWidget(self.logo_label)
+        
         self.sidebar_layout = QVBoxLayout()
         self.sidebar_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         
-        btn_style = "QPushButton { background-color: #444; border-radius: 5px; padding: 10px; font-weight: bold; }"
-        
         self.btn_cad = QPushButton("1. 📂 Upload CAD Model")
-        self.btn_cad.setStyleSheet(btn_style)
+        self.btn_cad.setStyleSheet(self.btn_style_unified)
         self.btn_cad.clicked.connect(self.upload_cad)
         self.sidebar_layout.addWidget(self.btn_cad)
         
         self.appearance_layout = QHBoxLayout()
         
         self.btn_color = QPushButton("2a. 🎨 Color")
-        self.btn_color.setStyleSheet(f"background-color: {self.mask_color.name()}; color: black; padding: 10px; border-radius: 5px; font-weight: bold;")
+        self.btn_color.setStyleSheet(self.btn_style_unified)
         self.btn_color.clicked.connect(self.pick_color)
         
         self.btn_texture = QPushButton("2b. 🖼️ Texture")
-        self.btn_texture.setStyleSheet(btn_style)
+        self.btn_texture.setStyleSheet(self.btn_style_unified)
         self.btn_texture.clicked.connect(self.open_texture_dialog)
         
         self.appearance_layout.addWidget(self.btn_color)
@@ -345,7 +398,7 @@ class ClientApp(QMainWindow):
         self.sidebar_layout.addLayout(self.appearance_layout)
 
         self.btn_mask = QPushButton("3. ✏️ Draw Mask")
-        self.btn_mask.setStyleSheet(btn_style)
+        self.btn_mask.setStyleSheet(self.btn_style_unified)
         self.btn_mask.clicked.connect(self.start_drawing_mode)
         self.sidebar_layout.addWidget(self.btn_mask)
 
@@ -353,10 +406,10 @@ class ClientApp(QMainWindow):
 
         self.btn_start = QPushButton("🚀 Start Tracking")
         self.style_disabled = "background-color: #555; color: #888; border-radius: 5px; padding: 15px; font-weight: bold; font-size: 16px;"
-        self.style_start = "background-color: #2196F3; color: white; border-radius: 5px; padding: 15px; font-weight: bold; font-size: 16px;"
-        self.style_stop = "background-color: #d32f2f; color: white; border-radius: 5px; padding: 15px; font-weight: bold; font-size: 16px;"
+        self.style_start = "background-color: #0098A1; color: white; border-radius: 5px; padding: 15px; font-weight: bold; font-size: 16px;" 
+        self.style_stop = "background-color: #CC071E; color: white; border-radius: 5px; padding: 15px; font-weight: bold; font-size: 16px;"
 
-        self.btn_start.setStyleSheet(self.style_disabled)
+        self.btn_start.setStyleSheet(self.btn_style_unified)
         self.btn_start.setEnabled(False) 
         self.btn_start.clicked.connect(self.toggle_tracking)
         self.sidebar_layout.addWidget(self.btn_start)
@@ -364,7 +417,7 @@ class ClientApp(QMainWindow):
         self.sidebar_layout.addSpacing(10)
         
         self.btn_log = QPushButton("💾 Download Log")
-        self.btn_log.setStyleSheet(self.style_disabled)
+        self.btn_log.setStyleSheet(self.btn_style_unified)
         self.btn_log.setEnabled(False)
         self.btn_log.clicked.connect(self.save_log_file)
         self.sidebar_layout.addWidget(self.btn_log)
@@ -375,7 +428,7 @@ class ClientApp(QMainWindow):
         self.cad_preview.setMinimumSize(200, 200)
         self.sidebar_layout.addWidget(self.cad_preview)
 
-        self.main_layout.addWidget(self.image_label)
+        self.main_layout.addWidget(self.left_container)
         self.main_layout.addLayout(self.sidebar_layout)
 
         self.thread = RealSenseThread(self.server_ip)
@@ -399,11 +452,11 @@ class ClientApp(QMainWindow):
         if self.status_cad and self.status_appearance and self.status_mask:
             self.btn_start.setEnabled(True)
             self.btn_start.setText("🚀 Start Tracking")
-            self.btn_start.setStyleSheet(self.style_start)
+            #self.btn_start.setStyleSheet(self.style_start)
         else:
             self.btn_start.setEnabled(False)
             self.btn_start.setText("🚀 Start Tracking")
-            self.btn_start.setStyleSheet(self.style_disabled)
+            #self.btn_start.setStyleSheet(self.style_disabled)
 
     def toggle_tracking(self):
         self.current_box_points = None
@@ -414,26 +467,28 @@ class ClientApp(QMainWindow):
             self.image_counter = 0 
             self.tracking_fps_buffer.clear()
             self.tracking_fps = 0
+            
             self.btn_log.setEnabled(False) 
-            self.btn_log.setStyleSheet(self.style_disabled)
+            
             self.thread.tracking_active = True
             self.btn_start.setText("🛑 Stop Tracking")
-            self.btn_start.setStyleSheet(self.style_stop)
+            
             self.btn_cad.setEnabled(False); self.btn_mask.setEnabled(False)
             self.btn_color.setEnabled(False); self.btn_texture.setEnabled(False)
         else:
             self.thread.tracking_active = False
             self.tracking_fps = 0
-            self.btn_start.setText("🚀 Start Tracking")
+            self.btn_start.setText("🚀 Start Tracking") # Nur Text ändert sich
+            
             self.btn_cad.setEnabled(True); self.btn_mask.setEnabled(True)
             self.btn_color.setEnabled(True); self.btn_texture.setEnabled(True)
             self.btn_log.setEnabled(True)
-            self.btn_log.setStyleSheet("background-color: #f57c00; color: white; border-radius: 5px; padding: 15px; font-weight: bold;")
+            
             print("[CLIENT] Resetting Mask State...")
             self.status_mask = False
             self.mask_points = []
             self.btn_mask.setText("3. ✏️ Draw Mask")
-            self.btn_mask.setStyleSheet("QPushButton { background-color: #444; border-radius: 5px; padding: 10px; font-weight: bold; }")
+            
             self.check_ready_status()
             try:
                 self.cmd_socket.send_pyobj({"cmd": "STOP"})
@@ -447,11 +502,12 @@ class ClientApp(QMainWindow):
             self.cad_preview.load_mesh(file_path, self.mask_color)
             try:
                 with open(file_path, "rb") as f: file_data = f.read()
-                payload = {"cmd": "UPLOAD_CAD", "data": file_data, "filename": os.path.basename(file_path)}
+                filename = os.path.basename(file_path)
+                payload = {"cmd": "UPLOAD_CAD", "data": file_data, "filename": filename}
                 self.cmd_socket.send_pyobj(payload)
                 self.cmd_socket.recv_string()
                 self.btn_cad.setText("✅ CAD Uploaded")
-                self.btn_cad.setStyleSheet("background-color: #2e7d32; padding: 10px; border-radius: 5px;")
+                #self.btn_cad.setStyleSheet("background-color: #2e7d32; padding: 10px; border-radius: 5px;")
                 self.status_cad = True
                 self.check_ready_status()
             except Exception as e:
@@ -466,7 +522,7 @@ class ClientApp(QMainWindow):
         elif len(self.mask_points) == 2:
             self.drawing_mode = False
             self.btn_mask.setText("✅ Mask Ready")
-            self.btn_mask.setStyleSheet("background-color: #2e7d32; padding: 10px; border-radius: 5px;")
+            #self.btn_mask.setStyleSheet("background-color: #2e7d32; padding: 10px; border-radius: 5px;")
             profile = self.thread.pipeline.get_active_profile()
             intr = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
             K = [[intr.fx, 0, intr.ppx], [0, intr.fy, intr.ppy], [0, 0, 1]]
@@ -483,7 +539,7 @@ class ClientApp(QMainWindow):
         self.drawing_mode = True
         self.mask_points = []
         self.btn_mask.setText("Click Point 1...")
-        self.btn_mask.setStyleSheet("background-color: #d32f2f; padding: 10px; border-radius: 5px;")
+        #self.btn_mask.setStyleSheet("background-color: #d32f2f; padding: 10px; border-radius: 5px;")
         self.status_mask = False 
         self.check_ready_status()
 
@@ -511,6 +567,7 @@ class ClientApp(QMainWindow):
             if not textures:
                 QMessageBox.information(self, "Info", "Keine Texturen gefunden.")
                 self.btn_texture.setText("2b. 🖼️ Texture")
+                self.btn_texture.setStyleSheet(self.btn_style_unified)
                 return
 
             dlg = TextureSelectorDialog(textures, self)
@@ -538,9 +595,7 @@ class ClientApp(QMainWindow):
                 
                 if resp == "OK" or "NO MESH" in resp:
                     self.btn_texture.setText(f"✅ {selected_name}")
-                    self.btn_texture.setStyleSheet("background-color: #2e7d32; padding: 10px; border-radius: 5px;")
-                    self.btn_color.setStyleSheet("QPushButton { background-color: #444; border-radius: 5px; padding: 10px; font-weight: bold; }")
-                    
+                    #.btn_texture.setStyleSheet("background-color: #2e7d32; padding: 10px; border-radius: 5px;")
                     self.status_appearance = True
                     self.check_ready_status()
                 else:
@@ -548,6 +603,7 @@ class ClientApp(QMainWindow):
             else:
                 if not self.status_appearance:
                     self.btn_texture.setText("2b. 🖼️ Texture")
+                    self.btn_texture.setStyleSheet(self.btn_style_unified)
                 else:
                     pass
 
@@ -560,9 +616,11 @@ class ClientApp(QMainWindow):
         if color.isValid():
             self.mask_color = color
             self.btn_color.setText("✅ Color")
-            self.btn_color.setStyleSheet(f"background-color: {color.name()}; color: black; padding: 10px; border-radius: 5px; font-weight: bold;")
+            #self.btn_color.setStyleSheet(f"background-color: {color.name()}; color: black; padding: 10px; border-radius: 5px; font-weight: bold;")
+            
             self.btn_texture.setText("2b. 🖼️ Texture")
-            self.btn_texture.setStyleSheet("QPushButton { background-color: #444; border-radius: 5px; padding: 10px; font-weight: bold; }")
+            self.btn_texture.setStyleSheet(self.btn_style_unified)
+            
             self.cad_preview.update_color(self.mask_color)
             self.status_appearance = True
             self.check_ready_status()

@@ -3,4 +3,6 @@ models/
 *.log
 build/
 dist/
+logo/
 *.spec
+notes.txt
