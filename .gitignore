@@ -1,3 +1,6 @@
 MetaVisionFPLiveClientVenv/
 models/
 *.log
+build/
+dist/
+*.spec

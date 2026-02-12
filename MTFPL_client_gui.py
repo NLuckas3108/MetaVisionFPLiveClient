@@ -5,6 +5,7 @@ import numpy as np
 import pyrealsense2 as rs
 import zmq
 import zlib
+import os
 from collections import deque
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QVBoxLayout, 
                              QHBoxLayout, QWidget, QPushButton, QFileDialog, 
@@ -446,7 +447,7 @@ class ClientApp(QMainWindow):
             self.cad_preview.load_mesh(file_path, self.mask_color)
             try:
                 with open(file_path, "rb") as f: file_data = f.read()
-                payload = {"cmd": "UPLOAD_CAD", "data": file_data, "filename": file_path.split("/")[-1]}
+                payload = {"cmd": "UPLOAD_CAD", "data": file_data, "filename": os.path.basename(file_path)}
                 self.cmd_socket.send_pyobj(payload)
                 self.cmd_socket.recv_string()
                 self.btn_cad.setText("✅ CAD Uploaded")
@@ -648,6 +649,13 @@ class ClientApp(QMainWindow):
         event.accept()
 
 if __name__ == "__main__":
+    if hasattr(Qt.ApplicationAttribute, 'AA_EnableHighDpiScaling'):
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling, True)
+    if hasattr(Qt.ApplicationAttribute, 'AA_UseHighDpiPixmaps'):
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
+    
+    os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
+    
     app = QApplication(sys.argv)
     dialog = ManualConnectDialog()
     if dialog.exec(): 
