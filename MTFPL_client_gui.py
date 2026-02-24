@@ -214,7 +214,7 @@ class RealSenseThread(QThread):
                 rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
                 h, w, ch = rgb_image.shape
                 bytes_per_line = ch * w
-                qt_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+                qt_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
                 p = qt_img.scaled(640, 480, Qt.AspectRatioMode.IgnoreAspectRatio)
                 self.change_pixmap_signal.emit(p)
         except Exception as e:
