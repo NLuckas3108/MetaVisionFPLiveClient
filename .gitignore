@@ -6,3 +6,4 @@ dist/
 *.spec
 notes.txt
 *.zip
+.venv/

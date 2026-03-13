@@ -9,7 +9,7 @@ idna==3.11
 kiwisolver==1.4.9
 matplotlib==3.10.8
 numpy==1.26.4
-opencv-python==4.13.0.90
+opencv-python==4.10.0.84
 packaging==26.0
 pillow==12.1.0
 platformdirs==4.5.1

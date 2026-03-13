@@ -3,6 +3,8 @@ import cv2
 import time
 import numpy as np
 import pyrealsense2 as rs
+import zivid
+import zivid.experimental.calibration
 import zmq
 import zlib
 import os
@@ -168,66 +170,174 @@ class ResultReceiver(QThread):
     def stop(self):
         self.running = False; self.wait()
 
-class RealSenseThread(QThread):
+class CameraThread(QThread):
     change_pixmap_signal = pyqtSignal(QImage)
     connection_error_signal = pyqtSignal(str)
     intrinsics_signal = pyqtSignal(object)
+
     def __init__(self, server_ip):
         super().__init__()
         self._run_flag = True
         self.tracking_active = False 
-        self.pipeline = None
-        self.align = rs.align(rs.stream.color)
         self.server_ip = server_ip
+        
         self.context = zmq.Context()
         self.video_socket = self.context.socket(zmq.PUSH) 
         self.video_socket.connect(f"tcp://{self.server_ip}:5556")
         self.video_socket.setsockopt(zmq.SNDHWM, 1) 
+        
+        self.cam_type = None
+        self.rs_pipeline = None
+        self.zivid_app = None
+        self.zivid_camera = None
+
+    def detect_camera(self):
+        try:
+            rs_ctx = rs.context()
+            if len(rs_ctx.query_devices()) > 0:
+                print("[CLIENT] RealSense Kamera erkannt.")
+                self.cam_type = "realsense"
+                return True
+        except Exception as e:
+            print(f"RealSense Check Fehler: {e}")
+
+        try:
+            self.zivid_app = zivid.Application()
+            cams = self.zivid_app.cameras()
+            if len(cams) > 0:
+                print("[CLIENT] Zivid Kamera erkannt.")
+                self.cam_type = "zivid"
+                return True
+        except Exception as e:
+            print(f"Zivid Check Fehler: {e}")
+
+        return False
+
     def run(self):
-        self.pipeline = rs.pipeline()
+        if not self.detect_camera():
+            self.connection_error_signal.emit("Keine unterstützte Kamera (RealSense oder Zivid) gefunden.")
+            return
+
+        if self.cam_type == "realsense":
+            self.run_realsense()
+        elif self.cam_type == "zivid":
+            self.run_zivid()
+
+    def run_realsense(self):
+        self.rs_pipeline = rs.pipeline()
         config = rs.config()
         config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 60)
         config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 60)
+        align = rs.align(rs.stream.color)
+        
         try:
-            profile = self.pipeline.start(config)
-            print(f"[CLIENT] Kamera läuft. Sende an {self.server_ip}")
+            profile = self.rs_pipeline.start(config)
             intr = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
             K = np.array([[intr.fx, 0, intr.ppx], [0, intr.fy, intr.ppy], [0, 0, 1]])
             self.intrinsics_signal.emit(K)
+            
             while self._run_flag:
-                frames = self.pipeline.wait_for_frames()
-                aligned_frames = self.align.process(frames)
+                frames = self.rs_pipeline.wait_for_frames()
+                aligned_frames = align.process(frames)
                 color_frame = aligned_frames.get_color_frame()
                 depth_frame = aligned_frames.get_depth_frame()
                 if not color_frame or not depth_frame: continue
+                
                 cv_img = np.asanyarray(color_frame.get_data())
                 depth_img = np.asanyarray(depth_frame.get_data())
-                if self.tracking_active:
-                    try:
-                        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 90] 
-                        _, rgb_encoded = cv2.imencode('.jpg', cv_img, encode_param)
-                        depth_bytes = depth_img.tobytes()
-                        depth_compressed = zlib.compress(depth_bytes, level=1)
-                        payload = {"rgb_compressed": rgb_encoded, "depth_compressed": depth_compressed, "shape": depth_img.shape, "dtype": str(depth_img.dtype)}
-                        self.video_socket.send_pyobj(payload, flags=zmq.NOBLOCK)
-                    except zmq.Again: pass 
-                rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
-                h, w, ch = rgb_image.shape
-                bytes_per_line = ch * w
-                qt_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
-                p = qt_img.scaled(640, 480, Qt.AspectRatioMode.IgnoreAspectRatio)
-                self.change_pixmap_signal.emit(p)
+                
+                self.process_and_send_frames(cv_img, depth_img)
+                
         except Exception as e:
-            print(f"[ERROR] Pipeline: {e}")
-            self.connection_error_signal.emit(f"Kamera Fehler: {e}")
+            self.connection_error_signal.emit(f"RealSense Fehler: {e}")
         finally:
-            self.stop_pipeline(); self.video_socket.close(); self.context.term()
+            if self.rs_pipeline: self.rs_pipeline.stop()
+            self.cleanup()
+
+    def run_zivid(self):
+        import zivid.experimental.calibration
+        
+        try:
+            self.zivid_camera = self.zivid_app.connect_camera()
+            
+            intr = zivid.experimental.calibration.intrinsics(self.zivid_camera)
+            
+            settings = zivid.Settings()
+            settings.acquisitions.append(zivid.Settings.Acquisition())
+
+            print("[CLIENT] Initialisiere Zivid Auflösung...")
+            frame = self.zivid_camera.capture(settings)
+            point_cloud = frame.point_cloud()
+            orig_h, orig_w = point_cloud.copy_data("rgba").shape[:2]
+
+            scale_x = 640 / orig_w
+            scale_y = 480 / orig_h
+
+            K = np.array([
+                [intr.camera_matrix.fx * scale_x, 0, intr.camera_matrix.cx * scale_x], 
+                [0, intr.camera_matrix.fy * scale_y, intr.camera_matrix.cy * scale_y], 
+                [0, 0, 1]
+            ])
+            self.intrinsics_signal.emit(K)
+
+            self._process_zivid_frame(point_cloud)
+
+            while self._run_flag:
+                frame = self.zivid_camera.capture(settings)
+                self._process_zivid_frame(frame.point_cloud())
+
+        except Exception as e:
+            self.connection_error_signal.emit(f"Zivid Fehler: {e}")
+        finally:
+            if self.zivid_camera: self.zivid_camera.disconnect()
+            self.cleanup()
+
+    def _process_zivid_frame(self, point_cloud):
+        rgba = point_cloud.copy_data("rgba")
+        cv_img_full = cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGR)
+
+        depth_float = point_cloud.copy_data("z")
+        depth_float = np.nan_to_num(depth_float, nan=0.0)
+        depth_img_full = depth_float.astype(np.uint16)
+
+        cv_img = cv2.resize(cv_img_full, (640, 480), interpolation=cv2.INTER_AREA)
+        
+        depth_img = cv2.resize(depth_img_full, (640, 480), interpolation=cv2.INTER_NEAREST)
+
+        self.process_and_send_frames(cv_img, depth_img)
+
+    def process_and_send_frames(self, cv_img, depth_img):
+        if self.tracking_active:
+            try:
+                encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 90] 
+                _, rgb_encoded = cv2.imencode('.jpg', cv_img, encode_param)
+                depth_compressed = zlib.compress(depth_img.tobytes(), level=1)
+                
+                payload = {
+                    "rgb_compressed": rgb_encoded, 
+                    "depth_compressed": depth_compressed, 
+                    "shape": depth_img.shape, 
+                    "dtype": str(depth_img.dtype)
+                }
+                self.video_socket.send_pyobj(payload, flags=zmq.NOBLOCK)
+            except zmq.Again: 
+                pass 
+
+        rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb_image.shape
+        bytes_per_line = ch * w
+        qt_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
+        
+        p = qt_img.scaled(640, 480, Qt.AspectRatioMode.IgnoreAspectRatio)
+        self.change_pixmap_signal.emit(p)
+
+    def cleanup(self):
+        self.video_socket.close()
+        self.context.term()
+
     def stop(self):
-        self._run_flag = False; self.wait()
-    def stop_pipeline(self):
-        if self.pipeline:
-            try: self.pipeline.stop()
-            except: pass
+        self._run_flag = False
+        self.wait()
 
 class CADPreviewWidget(QWidget):
     def __init__(self, parent=None):
@@ -431,7 +541,7 @@ class ClientApp(QMainWindow):
         self.main_layout.addWidget(self.left_container)
         self.main_layout.addLayout(self.sidebar_layout)
 
-        self.thread = RealSenseThread(self.server_ip)
+        self.thread = CameraThread(self.server_ip)
         self.thread.change_pixmap_signal.connect(self.update_image)
         self.thread.connection_error_signal.connect(self.show_camera_error)
         self.thread.intrinsics_signal.connect(self.set_intrinsics)
@@ -452,11 +562,9 @@ class ClientApp(QMainWindow):
         if self.status_cad and self.status_appearance and self.status_mask:
             self.btn_start.setEnabled(True)
             self.btn_start.setText("🚀 Start Tracking")
-            #self.btn_start.setStyleSheet(self.style_start)
         else:
             self.btn_start.setEnabled(False)
             self.btn_start.setText("🚀 Start Tracking")
-            #self.btn_start.setStyleSheet(self.style_disabled)
 
     def toggle_tracking(self):
         self.current_box_points = None
@@ -478,7 +586,7 @@ class ClientApp(QMainWindow):
         else:
             self.thread.tracking_active = False
             self.tracking_fps = 0
-            self.btn_start.setText("🚀 Start Tracking") # Nur Text ändert sich
+            self.btn_start.setText("🚀 Start Tracking") 
             
             self.btn_cad.setEnabled(True); self.btn_mask.setEnabled(True)
             self.btn_color.setEnabled(True); self.btn_texture.setEnabled(True)
@@ -507,7 +615,6 @@ class ClientApp(QMainWindow):
                 self.cmd_socket.send_pyobj(payload)
                 self.cmd_socket.recv_string()
                 self.btn_cad.setText("✅ CAD Uploaded")
-                #self.btn_cad.setStyleSheet("background-color: #2e7d32; padding: 10px; border-radius: 5px;")
                 self.status_cad = True
                 self.check_ready_status()
             except Exception as e:
@@ -522,16 +629,20 @@ class ClientApp(QMainWindow):
         elif len(self.mask_points) == 2:
             self.drawing_mode = False
             self.btn_mask.setText("✅ Mask Ready")
-            #self.btn_mask.setStyleSheet("background-color: #2e7d32; padding: 10px; border-radius: 5px;")
-            profile = self.thread.pipeline.get_active_profile()
-            intr = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
-            K = [[intr.fx, 0, intr.ppx], [0, intr.fy, intr.ppy], [0, 0, 1]]
+            
+            if self.K is None:
+                print("[ERROR] Intrinsics (K) wurden noch nicht von der Kamera geladen!")
+                return
+                
+            K_list = self.K.tolist() if isinstance(self.K, np.ndarray) else self.K
+            
             try:
-                self.cmd_socket.send_pyobj({"cmd": "SET_MASK", "points": self.mask_points, "K": K})
+                self.cmd_socket.send_pyobj({"cmd": "SET_MASK", "points": self.mask_points, "K": K_list})
                 self.cmd_socket.recv_string()
                 self.status_mask = True
                 self.check_ready_status()
-            except: pass
+            except Exception as e: 
+                print(f"Fehler beim Senden der Maske: {e}")
 
     def start_drawing_mode(self):
         if self.thread.tracking_active: self.toggle_tracking()
@@ -539,7 +650,6 @@ class ClientApp(QMainWindow):
         self.drawing_mode = True
         self.mask_points = []
         self.btn_mask.setText("Click Point 1...")
-        #self.btn_mask.setStyleSheet("background-color: #d32f2f; padding: 10px; border-radius: 5px;")
         self.status_mask = False 
         self.check_ready_status()
 
@@ -595,7 +705,6 @@ class ClientApp(QMainWindow):
                 
                 if resp == "OK" or "NO MESH" in resp:
                     self.btn_texture.setText(f"✅ {selected_name}")
-                    #.btn_texture.setStyleSheet("background-color: #2e7d32; padding: 10px; border-radius: 5px;")
                     self.status_appearance = True
                     self.check_ready_status()
                 else:
@@ -615,9 +724,7 @@ class ClientApp(QMainWindow):
         color = QColorDialog.getColor(initial=self.mask_color)
         if color.isValid():
             self.mask_color = color
-            self.btn_color.setText("✅ Color")
-            #self.btn_color.setStyleSheet(f"background-color: {color.name()}; color: black; padding: 10px; border-radius: 5px; font-weight: bold;")
-            
+            self.btn_color.setText("✅ Color")            
             self.btn_texture.setText("2b. 🖼️ Texture")
             self.btn_texture.setStyleSheet(self.btn_style_unified)
             
