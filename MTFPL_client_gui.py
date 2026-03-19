@@ -384,10 +384,20 @@ class CADPreviewWidget(QWidget):
                 img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 tex = pv.numpy_to_texture(img)
                 
-                if hasattr(self.current_mesh, "texture_map_to_box"):
-                    mapped_mesh = self.current_mesh.texture_map_to_box()
+                has_uvs = False
+                if hasattr(self.current_mesh, 'active_texture_coordinates') and self.current_mesh.active_texture_coordinates is not None:
+                    has_uvs = True
+                elif hasattr(self.current_mesh, 't_coords') and self.current_mesh.t_coords is not None:
+                    has_uvs = True
+                
+                if has_uvs:
+                    mapped_mesh = self.current_mesh
                 else:
-                    mapped_mesh = self.current_mesh.texture_map_to_plane()
+                    print("[WARN] Keine UV-Koordinaten im Modell gefunden. Nutze Fallback-Mapping.")
+                    if hasattr(self.current_mesh, "texture_map_to_box"):
+                        mapped_mesh = self.current_mesh.texture_map_to_box()
+                    else:
+                        mapped_mesh = self.current_mesh.texture_map_to_plane()
                 
                 self.mesh_actor.mapper.dataset = mapped_mesh
                 self.mesh_actor.texture = tex
@@ -455,7 +465,7 @@ class ClientApp(QMainWindow):
         self.context = zmq.Context()
         self.cmd_socket = self.context.socket(zmq.REQ)
         self.cmd_socket.connect(f"tcp://{self.server_ip}:5555")
-        self.cmd_socket.setsockopt(zmq.RCVTIMEO, 15000)
+        self.cmd_socket.setsockopt(zmq.RCVTIMEO, 60000)
 
         self.status_cad = False
         self.status_appearance = False 
@@ -608,17 +618,57 @@ class ClientApp(QMainWindow):
         if file_path:
             self.btn_cad.setText("⏳ Uploading...")
             self.cad_preview.load_mesh(file_path, self.mask_color)
+            
+            # 1. Pfade für MTL und PNG ableiten
+            base_path = os.path.splitext(file_path)[0]
+            mtl_path = base_path + ".mtl"
+            png_path = base_path + ".png"
+            
+            # Prüfen, ob beide existieren
+            has_auto_texture = os.path.exists(mtl_path) and os.path.exists(png_path)
+
             try:
-                with open(file_path, "rb") as f: file_data = f.read()
+                with open(file_path, "rb") as f: 
+                    obj_data = f.read()
                 filename = os.path.basename(file_path)
-                payload = {"cmd": "UPLOAD_CAD", "data": file_data, "filename": filename}
+
+                # 2. Payload abhängig vom Vorhandensein der Textur bauen
+                if has_auto_texture:
+                    with open(mtl_path, "rb") as f: mtl_data = f.read()
+                    with open(png_path, "rb") as f: png_data = f.read()
+                    
+                    payload = {
+                        "cmd": "UPLOAD_CAD_BUNDLE", 
+                        "filename": filename,
+                        "obj_data": obj_data,
+                        "mtl_data": mtl_data,
+                        "png_data": png_data
+                    }
+                else:
+                    payload = {
+                        "cmd": "UPLOAD_CAD", 
+                        "filename": filename,
+                        "data": obj_data
+                    }
+
+                # 3. An Server senden
                 self.cmd_socket.send_pyobj(payload)
                 self.cmd_socket.recv_string()
+                
+                # 4. UI Updates
                 self.btn_cad.setText("✅ CAD Uploaded")
                 self.status_cad = True
+                
+                if has_auto_texture:
+                    # Direkte Vorschau im Client und UI-Freischaltung
+                    self.cad_preview.update_texture(png_data)
+                    self.btn_texture.setText("✅ Auto-Texture")
+                    self.status_appearance = True
+
                 self.check_ready_status()
+
             except Exception as e:
-                print(f"ZMQ Error: {e}")
+                print(f"Upload Fehler: {e}")
                 self.btn_cad.setText("❌ Upload Failed")
 
     def handle_image_click(self, x, y):
@@ -629,20 +679,17 @@ class ClientApp(QMainWindow):
         elif len(self.mask_points) == 2:
             self.drawing_mode = False
             self.btn_mask.setText("✅ Mask Ready")
-            
-            if self.K is None:
-                print("[ERROR] Intrinsics (K) wurden noch nicht von der Kamera geladen!")
-                return
-                
-            K_list = self.K.tolist() if isinstance(self.K, np.ndarray) else self.K
-            
+            profile = self.thread.pipeline.get_active_profile()
+            intr = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+            K = [[intr.fx, 0, intr.ppx], [0, intr.fy, intr.ppy], [0, 0, 1]]
             try:
                 self.cmd_socket.send_pyobj({"cmd": "SET_MASK", "points": self.mask_points, "K": K_list})
                 self.cmd_socket.recv_string()
                 self.status_mask = True
                 self.check_ready_status()
-            except Exception as e: 
-                print(f"Fehler beim Senden der Maske: {e}")
+            except Exception as e:
+                print(f"[ERROR] Fehler beim Senden der Maske: {e}")
+                self.btn_mask.setText("Timeout Error")
 
     def start_drawing_mode(self):
         if self.thread.tracking_active: self.toggle_tracking()

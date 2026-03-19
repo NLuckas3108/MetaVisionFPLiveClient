@@ -6,4 +6,5 @@ dist/
 *.spec
 notes.txt
 *.zip
-.venv/
+logo/
+*.png
